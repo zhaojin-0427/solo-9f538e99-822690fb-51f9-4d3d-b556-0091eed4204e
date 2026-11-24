@@ -1,0 +1,21 @@
+services:
+  line-api:
+    build: .
+    image: seismic-line-api:latest
+    container_name: seismic-line-api
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/line.db
+    volumes:
+      - line-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  line-data:
