@@ -180,3 +180,110 @@ def test_lookups_use_indexed_reads_only(tmp_path):
     assert "USING INTEGER PRIMARY KEY" in plan_text
     assert "SCAN" not in plan_text
     repo.close()
+
+
+def test_window_and_flags_keep_logarithmic_cost_at_scale(tmp_path):
+    """Window picks and flag flips stay height-bound at n = 1e6.
+
+    * a flag flip updates only one root-to-leaf path of current_agg and
+      never rescans the line;
+    * a move adds current_agg rows only for the O(height) new treap nodes,
+      not for the moved block's shared subtrees;
+    * a window query reads O(height) rows regardless of window width and
+      matches a brute-force reference on sampled sub-windows.
+    """
+    import random
+    repo = _new_repo(tmp_path)
+    n = N
+    repo.initialize(n)
+    conn = repo._conn
+
+    rng = random.Random(424)
+    bad = set(rng.sample(range(1, n + 1), 500))
+    t0 = time.perf_counter()
+    for trace in bad:
+        repo.set_bad_trace(trace, True)
+    flag_seconds = (time.perf_counter() - t0) / len(bad)
+    assert flag_seconds < 0.05  # ms-level per single-trace correction
+
+    # Each flip rewrites only the nodes on one path; table size is
+    # unchanged because rows are updated in place.
+    agg_total = conn.execute(
+        "SELECT COUNT(*) FROM current_agg").fetchone()[0]
+    assert agg_total == n
+    repo.set_bad_trace(next(iter(bad)), False)
+    assert conn.execute("SELECT COUNT(*) FROM current_agg"
+                        ).fetchone()[0] == agg_total
+
+    # A wide move: the moved block's shared subtrees must not be rebuilt.
+    node_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM treap_nodes").fetchone()[0]
+    agg_before = conn.execute(
+        "SELECT COUNT(*) FROM current_agg").fetchone()[0]
+    result = repo.move_segment(1, n // 4, 3 * n // 4, n)
+    assert result["version"] == 2
+    new_nodes = conn.execute(
+        "SELECT COUNT(*) FROM treap_nodes WHERE id > ?",
+        (node_before,)).fetchone()[0]
+    new_aggs = conn.execute(
+        "SELECT COUNT(*) FROM current_agg").fetchone()[0] - agg_before
+    assert new_aggs == new_nodes  # one summary per new node, nothing else
+    assert new_nodes < 20_000     # height-bound, independent of block size
+
+    # Build the expected current order for reference checking.
+    order = reference_move(list(range(1, n + 1)), n // 4, 3 * n // 4, n)
+    bad.discard(next(iter(bad)))
+
+    # Window queries over windows of very different widths; each must be a
+    # handful of indexed reads and agree with the brute-force reference.
+    windows = [(1, n), (1, n // 2), (n // 3, 2 * n // 3),
+               (10, 10_000), (n - 50, n), (1, 1), (n // 2, n // 2 + 1)]
+    t0 = time.perf_counter()
+    for lo, hi in windows:
+        body = repo.find_window(lo, hi)
+        assert body["version"] == 2
+        # Brute-force reference over the same window.
+        best_len = best_start = cur = 0
+        cur_start = lo
+        prev_good, prev_value = False, None
+        for pos in range(lo, hi + 1):
+            trace = order[pos - 1]
+            continues = (pos > lo and trace not in bad and prev_good
+                         and trace == prev_value + 1)
+            if trace in bad:
+                cur = 0
+            else:
+                if not continues:
+                    cur_start = pos
+                cur = cur + 1 if continues else 1
+            if cur > best_len:
+                best_len, best_start = cur, cur_start
+            prev_good, prev_value = trace not in bad, trace
+        if best_len == 0:
+            assert body["segment"] is None
+        else:
+            seg = body["segment"]
+            assert seg["start_position"] == best_start
+            assert seg["length"] == best_len
+            assert seg["end_position"] == best_start + best_len - 1
+            assert seg["start_original_trace"] == order[best_start - 1]
+            assert seg["end_original_trace"] == \
+                order[best_start + best_len - 2]
+    window_seconds = (time.perf_counter() - t0) / len(windows)
+    assert window_seconds < 0.05
+
+    # EXPLAIN QUERY PLAN: the bad-traces lookup and the aggregate point read
+    # stay index-only.
+    plan_text = " ".join(dict(p)["detail"] for p in conn.execute(
+        "EXPLAIN QUERY PLAN SELECT original_trace FROM bad_traces "
+        "WHERE original_trace = 42"))
+    assert "SCAN" not in plan_text
+    plan_text = " ".join(dict(p)["detail"] for p in conn.execute(
+        "EXPLAIN QUERY PLAN SELECT best, best_start FROM current_agg "
+        "WHERE node_id = 42"))
+    assert "SEARCH" in plan_text and "SCAN" not in plan_text
+
+    print(f"\n[n={n}] per_flag={flag_seconds * 1000:.2f}ms "
+          f"new_agg_rows={new_aggs} "
+          f"avg_window={window_seconds * 1000:.2f}ms")
+    repo.close()

@@ -18,6 +18,19 @@ GET  /line/lookup
 GET  /line/traces/{original_trace}
     Where an original trace currently sits.
 
+PUT  /line/bad-traces/{original_trace}
+    Register a bad-trace flag on one original trace (idempotent).
+
+DELETE /line/bad-traces/{original_trace}
+    Clear the bad-trace flag of one original trace (idempotent).
+
+GET  /line/bad-traces
+    All currently flagged original trace numbers.
+
+GET  /line/window?start=&end=
+    Longest usable segment inside the inclusive current-position window:
+    unmarked traces whose original ids increase by exactly one.
+
 GET  /line/versions
     Published version history.
 
@@ -43,10 +56,13 @@ DB_PATH = os.environ.get("DB_PATH", "line.db")
 
 app = FastAPI(
     title="Seismic line trace-ordering API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Maintains one survey line's trace ordering across versions. "
-        "Moves are versioned; every published version stays queryable."
+        "Moves are versioned; every published version stays queryable. "
+        "Bad-trace flags are keyed by original trace number and travel "
+        "with the trace across moves; the window endpoint returns the "
+        "longest unmarked, consecutive segment inside a position range."
     ),
 )
 repo = LineRepository(DB_PATH)
@@ -129,6 +145,36 @@ def lookup_position(version: int, position: int) -> dict:
 @app.get("/line/traces/{original_trace}")
 def lookup_trace(original_trace: int) -> dict:
     return repo.lookup_trace(original_trace)
+
+
+@app.put("/line/bad-traces/{original_trace}")
+def mark_bad_trace(original_trace: int) -> dict:
+    """Register a bad-trace flag. Flags are keyed by original trace number,
+    so later segment moves carry the flag with the trace."""
+    return repo.set_bad_trace(original_trace, bad=True)
+
+
+@app.delete("/line/bad-traces/{original_trace}")
+def clear_bad_trace(original_trace: int) -> dict:
+    """Clear a bad-trace flag. Idempotent when the trace was not flagged."""
+    return repo.set_bad_trace(original_trace, bad=False)
+
+
+@app.get("/line/bad-traces")
+def list_bad_traces() -> dict:
+    return repo.list_bad_traces()
+
+
+@app.get("/line/window")
+def find_window(start: int, end: int) -> dict:
+    """Longest usable segment within inclusive current positions [start, end].
+
+    A usable segment contains no bad trace and its original trace numbers
+    increase by exactly one per position. Ties return the leftmost segment;
+    an all-unusable window returns ``segment: null``. The trace order and
+    the bad-trace flags are read from one committed snapshot.
+    """
+    return repo.find_window(start, end)
 
 
 @app.get("/line/versions")

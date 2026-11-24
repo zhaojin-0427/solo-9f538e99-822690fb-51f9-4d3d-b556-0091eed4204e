@@ -27,13 +27,28 @@ current_node
     Mutable mirror: original trace number -> node id in the current tree,
     likewise O(log n) rewrites per move.
 
+bad_traces
+    Original trace numbers flagged as bad. Keyed by *original* trace number,
+    not by position, so a move never has to touch these rows: the flag stays
+    attached to the physical trace wherever the move relocates it.
+
+current_agg
+    Mutable windowing mirror: for every node of the current tree, the
+    windowing monoid summary (see :mod:`app.window`) of its subtree.
+    A move inserts summaries only for the O(log n) newly allocated nodes -
+    shared subtrees keep their rows untouched. Flipping one bad-trace flag
+    recomputes only the O(log n) nodes on that trace's root-to-leaf path,
+    so neither operation rescans the line nor rebuilds the moved block.
+    Rows for nodes that left the current tree are retained but unreferenced.
+
 Concurrency
 -----------
-A process-local writer lock serialises moves; each move is one SQL
-transaction, so a failed write rolls back completely and never creates a
-version. Readers open their own snapshot transactions (WAL mode); an entire
-lookup therefore sees one committed state even while a move is in flight,
-and all published versions remain queryable after a restart.
+A process-local writer lock serialises moves and flag changes; each write
+is one SQL transaction, so a failed write rolls back completely and never
+creates a version or a partial flag change. Readers open their own snapshot
+transactions (WAL mode); an entire lookup or window query therefore sees one
+committed state - the trace order and the bad-trace flags come from the same
+snapshot - even while a write is in flight.
 """
 from __future__ import annotations
 
@@ -41,6 +56,7 @@ import sqlite3
 import threading
 
 from .treap import Node, TreapStore, merge, random_priority, split
+from .window import BEST, BEST_START, combine, leaf
 
 
 class StaleVersionError(Exception):
@@ -87,7 +103,29 @@ CREATE TABLE IF NOT EXISTS current_node (
     original_trace INTEGER PRIMARY KEY,
     node_id INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS bad_traces (
+    original_trace INTEGER PRIMARY KEY
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS current_agg (
+    node_id INTEGER PRIMARY KEY,
+    size INTEGER NOT NULL,
+    first_trace INTEGER NOT NULL,
+    last_trace INTEGER NOT NULL,
+    first_good INTEGER NOT NULL,
+    last_good INTEGER NOT NULL,
+    all_consec INTEGER NOT NULL,
+    pref INTEGER NOT NULL,
+    suff INTEGER NOT NULL,
+    suff_start INTEGER NOT NULL,
+    best INTEGER NOT NULL,
+    best_start INTEGER NOT NULL
+);
 """
+
+AGG_COLUMNS = (
+    "size", "first_trace", "last_trace", "first_good", "last_good",
+    "all_consec", "pref", "suff", "suff_start", "best", "best_start",
+)
 
 
 class EagerSqliteStore(TreapStore):
@@ -102,6 +140,11 @@ class EagerSqliteStore(TreapStore):
             "SELECT COALESCE(MAX(id), 0) FROM treap_nodes"
         ).fetchone()[0] + 1
         self._pending: list[Node] = []
+
+    @property
+    def next_id(self) -> int:
+        """Id that the next allocated node will receive."""
+        return self._next_id
 
     def get_node(self, node_id: int) -> Node:
         if node_id == 0:
@@ -186,6 +229,7 @@ class LineRepository:
                     (root,),
                 )
                 self._populate_initial_mirrors(root)
+                self._populate_initial_agg()
                 self._conn.execute("COMMIT")
                 return 1
             except Exception:
@@ -273,7 +317,36 @@ class LineRepository:
                 "VALUES (?, ?)",
                 trace_rows[i:i + 1000],
             )
-        del self._initial_rows
+        # self._initial_rows is released by _populate_initial_agg, which
+        # runs next and still needs it.
+
+    def _populate_initial_agg(self) -> None:
+        """One-time O(n) fill of current_agg.
+
+        At initialization no trace is bad, so every leaf is a good
+        singleton. Nodes are allocated post-order (children before their
+        parent), hence each row's children already have a summary when the
+        row is visited; the whole fill runs on in-memory data.
+        """
+        conn = self._conn
+        rows = self._initial_rows
+        aggs: dict[int, tuple] = {}
+        out: list[tuple] = []
+        for node_id, value, _prio, left, right, _size in rows:
+            agg = combine(
+                aggs.get(left),
+                combine(leaf(value, False), aggs.get(right)),
+            )
+            aggs[node_id] = agg
+            out.append((node_id, *agg))
+        for i in range(0, len(out), 1000):
+            conn.executemany(
+                "INSERT INTO current_agg (node_id, " + ", ".join(AGG_COLUMNS)
+                + ") VALUES (" + ", ".join("?" * (len(AGG_COLUMNS) + 1)) + ")",
+                out[i:i + 1000],
+            )
+        del aggs
+        del self._initial_rows  # mirrors and aggregates are now persisted
 
     # ---------------------------------------------------------------- reads
     def _read_conn(self) -> sqlite3.Connection:
@@ -486,6 +559,7 @@ class LineRepository:
                 self._validate_move(n, start, end, insert_after)
                 root = int(meta["current_root"])
                 store = EagerSqliteStore(self._conn)
+                first_new_id = store.next_id
 
                 # Extract [start, end]; internal order of the segment is
                 # preserved because split never reorders elements.
@@ -521,6 +595,7 @@ class LineRepository:
                     (new_version, new_root),
                 )
                 self._sync_mirrors(root, new_root)
+                self._sync_window_agg(store, first_new_id)
                 self._conn.execute("COMMIT")
                 return {
                     "version": new_version,
@@ -605,3 +680,300 @@ class LineRepository:
         # Rows belonging to nodes that no longer belong to the current tree
         # are harmless (never referenced from current_node/current_root);
         # they are kept to avoid O(n) deletes.
+
+    # ------------------------------------------------------- bad traces /
+    # windowing mirrors
+    def _sync_window_agg(self, store: EagerSqliteStore,
+                         first_new_id: int) -> None:
+        """Insert current_agg rows for the nodes a move just allocated.
+
+        Split/merge create nodes in post-order dependency order (a child is
+        always allocated before its parent) with consecutive ids, so
+        visiting the new id range in order guarantees that every child
+        summary is already available - either in ``current_agg`` for a
+        shared subtree or inserted earlier in this same loop for a freshly
+        allocated child. The moved block's shared subtrees keep their
+        existing rows and are never rebuilt.
+        """
+        conn = self._conn
+        rows = conn.execute(
+            "SELECT id, value, left, right FROM treap_nodes "
+            "WHERE id >= ? ORDER BY id", (first_new_id,),
+        ).fetchall()
+        if not rows:
+            return
+        bad_set = self._load_bad_set(conn, [r[1] for r in rows])
+        agg_cache: dict[int, tuple] = {}
+        out: list[tuple] = []
+        for node_id, value, left, right in rows:
+            agg = combine(
+                self._agg_of(conn, int(left), agg_cache),
+                combine(leaf(int(value), int(value) in bad_set),
+                        self._agg_of(conn, int(right), agg_cache)),
+            )
+            agg_cache[node_id] = agg
+            out.append((node_id, *agg))
+        placeholders = ", ".join("?" for _ in AGG_COLUMNS)
+        conn.executemany(
+            f"INSERT INTO current_agg (node_id, {', '.join(AGG_COLUMNS)}) "
+            f"VALUES (?, {placeholders})",
+            out,
+        )
+
+    @staticmethod
+    def _load_bad_set(conn: sqlite3.Connection,
+                      values: list[int]) -> set[int]:
+        """Which of the given original trace numbers are currently bad.
+
+        One indexed IN-query per call regardless of how many traces are
+        involved, so a move or a flag flip never scans bad_traces.
+        """
+        if not values:
+            return set()
+        unique = list(dict.fromkeys(values))
+        # SQLite accepts at most 999 host parameters in one statement.
+        bad: set[int] = set()
+        for i in range(0, len(unique), 900):
+            chunk = unique[i:i + 900]
+            placeholders = ", ".join("?" for _ in chunk)
+            bad.update(r[0] for r in conn.execute(
+                f"SELECT original_trace FROM bad_traces "
+                f"WHERE original_trace IN ({placeholders})", chunk))
+        return bad
+
+    def _agg_of(self, conn: sqlite3.Connection, node_id: int,
+                cache: dict[int, tuple]) -> tuple | None:
+        if node_id == 0:
+            return None
+        cached = cache.get(node_id)
+        if cached is not None:
+            return cached
+        row = conn.execute(
+            f"SELECT {', '.join(AGG_COLUMNS)} FROM current_agg "
+            "WHERE node_id = ?", (node_id,),
+        ).fetchone()
+        if row is None:  # pragma: no cover - invariant
+            raise NotFoundError(f"window aggregate missing for node {node_id}")
+        agg = tuple(row)
+        cache[node_id] = agg
+        return agg
+
+    def set_bad_trace(self, original_trace: int, bad: bool) -> dict:
+        """Register (``bad=True``) or clear (``bad=False``) one bad-trace
+        flag, identified by original trace number.
+
+        The flag is keyed by original trace number, so moves carry it along
+        automatically. Only the O(height) root-to-leaf path of that trace
+        is recomputed in current_agg; the rest of the line is untouched.
+        Idempotent: re-applying the current state changes nothing.
+        """
+        with self._writer_lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                n = self._require_total(self._conn)
+                if not (1 <= original_trace <= n):
+                    raise InvalidMoveError(
+                        f"original_trace must be between 1 and {n}"
+                    )
+                existed = self._conn.execute(
+                    "SELECT 1 FROM bad_traces WHERE original_trace = ?",
+                    (original_trace,),
+                ).fetchone() is not None
+                changed = existed != bad
+                if changed:
+                    if bad:
+                        self._conn.execute(
+                            "INSERT INTO bad_traces (original_trace) "
+                            "VALUES (?)", (original_trace,))
+                    else:
+                        self._conn.execute(
+                            "DELETE FROM bad_traces WHERE original_trace = ?",
+                            (original_trace,))
+                    self._recompute_agg_path(original_trace, bad)
+                self._conn.execute("COMMIT")
+                return {
+                    "original_trace": original_trace,
+                    "bad": bad,
+                    "changed": changed,
+                }
+            except Exception:
+                self._rollback_safely()
+                raise
+
+    def _recompute_agg_path(self, original_trace: int, is_bad: bool) -> None:
+        """Re-summarise one trace's leaf and every ancestor up to the root.
+
+        O(height) indexed reads/writes; sibling subtrees are read from
+        current_agg and never walked.
+        """
+        conn = self._conn
+        node_row = conn.execute(
+            "SELECT node_id FROM current_node WHERE original_trace = ?",
+            (original_trace,),
+        ).fetchone()
+        if node_row is None:  # pragma: no cover - invariant
+            raise NotFoundError(
+                f"trace {original_trace} not found in current version")
+        node_id = int(node_row["node_id"])
+        cache: dict[int, tuple] = {}
+        out: list[tuple] = []
+        while node_id:
+            row = conn.execute(
+                "SELECT value, left, right FROM treap_nodes WHERE id = ?",
+                (node_id,),
+            ).fetchone()
+            if int(row["left"]) == 0 and int(row["right"]) == 0:
+                agg = leaf(int(row["value"]), is_bad)
+            else:
+                agg = combine(
+                    self._agg_of(conn, int(row["left"]), cache),
+                    combine(
+                        leaf(int(row["value"]),
+                             self._is_bad(conn, int(row["value"]))),
+                        self._agg_of(conn, int(row["right"]), cache),
+                    ),
+                )
+            cache[node_id] = agg
+            out.append((node_id, *agg))
+            parent = conn.execute(
+                "SELECT parent_id FROM current_parent WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+            if parent is None or int(parent["parent_id"]) == 0:
+                break
+            node_id = int(parent["parent_id"])
+        placeholders = ", ".join("?" for _ in AGG_COLUMNS)
+        conn.executemany(
+            f"INSERT INTO current_agg (node_id, {', '.join(AGG_COLUMNS)}) "
+            f"VALUES (?, {placeholders}) ON CONFLICT(node_id) DO UPDATE SET "
+            + ", ".join(f"{c} = excluded.{c}" for c in AGG_COLUMNS),
+            out,
+        )
+
+    @staticmethod
+    def _is_bad(conn: sqlite3.Connection, original_trace: int) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM bad_traces WHERE original_trace = ?",
+            (original_trace,),
+        ).fetchone() is not None
+
+    @staticmethod
+    def _require_total(conn: sqlite3.Connection) -> int:
+        row = conn.execute(
+            "SELECT total_traces FROM meta WHERE id = 0"
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("line has not been initialized")
+        return int(row["total_traces"])
+
+    def list_bad_traces(self) -> dict:
+        conn = self._read_conn()
+        try:
+            conn.execute("BEGIN")
+            n = self._require_total(conn)
+            traces = [r[0] for r in conn.execute(
+                "SELECT original_trace FROM bad_traces ORDER BY "
+                "original_trace")]
+            conn.execute("COMMIT")
+            return {"total_traces": n, "count": len(traces),
+                    "bad_traces": traces}
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def find_window(self, start: int, end: int) -> dict:
+        """Longest usable segment within current positions [start, end].
+
+        Usable = every trace unmarked and original ids increasing by one.
+        The range is folded over the O(height) treap nodes covering it, so
+        no trace is scanned and candidate segments are never compared one by
+        one; the monoid keeps only the leftmost longest run. Ties therefore
+        resolve to the earliest segment, and a window without any usable
+        trace returns ``segment = null``. Ordering and flags are read inside
+        one snapshot transaction, i.e. from the same committed state.
+        """
+        conn = self._read_conn()
+        try:
+            conn.execute("BEGIN")
+            meta = conn.execute(
+                "SELECT total_traces, current_version, current_root "
+                "FROM meta WHERE id = 0"
+            ).fetchone()
+            if meta is None:
+                raise NotFoundError("line has not been initialized")
+            n = int(meta["total_traces"])
+            if not (1 <= start <= n) or not (start <= end <= n):
+                raise InvalidMoveError(
+                    f"window must satisfy 1 <= start <= end <= {n}"
+                )
+            version = int(meta["current_version"])
+            agg = self._range_agg(conn, int(meta["current_root"]),
+                                  start, end, {})
+            if agg is None or agg[BEST] == 0:
+                conn.execute("COMMIT")
+                return {"version": version, "window": [start, end],
+                        "segment": None}
+            length = int(agg[BEST])
+            seg_start = start + int(agg[BEST_START]) - 1
+            seg_end = seg_start + length - 1
+            first_trace = self._kth(conn, int(meta["current_root"]),
+                                    seg_start)
+            last_trace = self._kth(conn, int(meta["current_root"]), seg_end)
+            conn.execute("COMMIT")
+            return {
+                "version": version,
+                "window": [start, end],
+                "segment": {
+                    "start_position": seg_start,
+                    "end_position": seg_end,
+                    "start_original_trace": first_trace,
+                    "end_original_trace": last_trace,
+                    "length": length,
+                },
+            }
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def _range_agg(self, conn: sqlite3.Connection, root: int,
+                   lo: int, hi: int, cache: dict) -> tuple | None:
+        """Monoid summary of inclusive 1-based positions [lo, hi].
+
+        Treap recursion follows only the O(height) nodes intersecting the
+        range; fully covered subtrees contribute their stored summary in a
+        single indexed read, so the number of reads is proportional to tree
+        height rather than the window's width. ``cache`` is shared across
+        the whole query so a summary read once is never read twice.
+        """
+        row = conn.execute(
+            "SELECT size, left, right FROM treap_nodes WHERE id = ?",
+            (root,),
+        ).fetchone()
+        size = int(row["size"])
+        if lo == 1 and hi == size:
+            return self._agg_of(conn, root, cache)
+        left_id, right_id = int(row["left"]), int(row["right"])
+        right_size = int(conn.execute(
+            "SELECT size FROM treap_nodes WHERE id = ?", (right_id,)
+        ).fetchone()[0]) if right_id else 0
+        left_size = size - 1 - right_size
+        result: tuple | None = None
+        if lo <= left_size:
+            result = self._range_agg(
+                conn, left_id, lo, min(hi, left_size), cache)
+        if lo <= left_size + 1 <= hi:
+            value = int(conn.execute(
+                "SELECT value FROM treap_nodes WHERE id = ?", (root,)
+            ).fetchone()[0])
+            result = combine(result, leaf(
+                value, self._is_bad(conn, value)))
+        if hi > left_size + 1:
+            result = combine(result, self._range_agg(
+                conn, right_id,
+                max(1, lo - left_size - 1), hi - left_size - 1, cache))
+        return result
+
